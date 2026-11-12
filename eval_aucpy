@@ -1,0 +1,102 @@
+import os
+import torch
+import torch.nn as nn
+import librosa
+import numpy as np
+from sklearn.metrics import roc_auc_score
+
+class AutoEncoder(nn.Module):
+    def __init__(self, mel_dim=128):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(mel_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, mel_dim),
+            nn.ReLU()
+        )
+    def forward(self, x):
+        z = self.encoder(x)
+        out = self.decoder(z)
+        return out
+
+SAMPLE_RATE = 16000
+N_MELS = 128
+def get_mel(filepath):
+    wav, sr = librosa.load(filepath, sr=SAMPLE_RATE)
+    mel = librosa.feature.melspectrogram(y=wav, sr=sr, n_mels=N_MELS)
+    mel = librosa.power_to_db(mel, ref=np.max)
+    mel = mel.T
+    return mel
+
+def load_test_data():
+    folders = ["./-6_dB", "./0_dB", "./6_dB"]
+    all_data = []
+    all_labels = []
+    file_cnt = 0
+    normal_cnt = 0
+    abnormal_cnt = 0
+    for root_dir in folders:
+        print(f"正在扫描: {root_dir}")
+        if not os.path.exists(root_dir):
+            print(f"⚠️ 不存在：{root_dir}")
+            continue
+        for subdir, _, files in os.walk(root_dir):
+            # 把路径切成一层一层文件夹名字
+            path_parts = [p.lower() for p in subdir.split(os.sep)]
+            for f in files:
+                if f.lower().endswith(".flac"):
+                    fp = os.path.join(subdir, f)
+                    file_cnt +=1
+                    mel = get_mel(fp)
+                    if "normal" in path_parts:
+                        lab = 0
+                        normal_cnt +=1
+                    elif "abnormal" in path_parts:
+                        lab = 1
+                        abnormal_cnt +=1
+                    else:
+                        continue
+                    for frame in mel:
+                        all_data.append(frame)
+                        all_labels.append(lab)
+    print(f"✅ 找到flac文件数量：{file_cnt}")
+    print(f"normal文件数：{normal_cnt}, abnormal文件数：{abnormal_cnt}")
+    print(f"标签种类：{np.unique(all_labels)}")
+    return np.array(all_data), np.array(all_labels)
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoEncoder(mel_dim=N_MELS).to(device)
+    weight = torch.load("model.pkl", map_location=device)
+    model.load_state_dict(weight)
+    model.eval()
+
+    X, y = load_test_data()
+    if len(X) == 0:
+        print("❌ 没有读到音频！")
+        return
+    if len(np.unique(y)) < 2:
+        print("❌ 只有一类音频，缺少正常或者异常，没法算AUC！")
+        return
+
+    all_scores = []
+    all_labels = []
+    with torch.no_grad():
+        for i in range(len(X)):
+            x = torch.from_numpy(X[i]).float().to(device).unsqueeze(0)
+            pred = model(x)
+            loss = torch.mean((x - pred)**2).item()
+            all_scores.append(loss)
+            all_labels.append(y[i])
+
+    auc = roc_auc_score(all_labels, all_scores)
+    print(f"===== AUC Score: {auc:.4f} =====")
+
+if __name__ == "__main__":
+    main()
